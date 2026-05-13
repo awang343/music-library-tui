@@ -18,7 +18,7 @@ impl Settings {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                 PathBuf::from(home).join(".config")
             });
-        base.join("music-lib-tui").join("config.toml")
+        base.join("mutui").join("config.toml")
     }
 
     pub fn load() -> Self {
