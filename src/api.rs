@@ -242,6 +242,52 @@ impl Client {
         }
         Ok(())
     }
+
+    pub fn trigger_scan(&self) -> Result<ScanState> {
+        match self.req("POST", "/api/scans").call() {
+            Ok(r) => r.into_json().context("decode scan state"),
+            Err(ureq::Error::Status(409, r)) => {
+                // Already running — return current state if parseable, else generic.
+                if let Ok(s) = r.into_json::<ScanState>() {
+                    Ok(s)
+                } else {
+                    anyhow::bail!("already running")
+                }
+            }
+            Err(ureq::Error::Status(_, r)) => {
+                let msg = r.into_string().unwrap_or_default();
+                anyhow::bail!("server: {msg}")
+            }
+            Err(e) => Err(e).context("POST /api/scans"),
+        }
+    }
+
+    pub fn scan_status(&self) -> Result<ScanState> {
+        self.req("GET", "/api/scans")
+            .call()
+            .context("GET /api/scans")?
+            .into_json()
+            .context("decode scan state")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ScanState {
+    pub running: bool,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub last_stats: Option<ScanStats>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScanStats {
+    pub seen: u64,
+    pub inserted: u64,
+    pub updated: u64,
+    pub unchanged: u64,
+    pub failed: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

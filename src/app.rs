@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 enum Mode {
@@ -141,6 +141,8 @@ pub struct App {
     status_msg: String,
     show_help: bool,
     should_quit: bool,
+    scan_polling: bool,
+    last_scan_poll: Instant,
 }
 
 impl App {
@@ -176,6 +178,8 @@ impl App {
             status_msg: String::new(),
             show_help: false,
             should_quit: false,
+            scan_polling: false,
+            last_scan_poll: Instant::now(),
         };
         app.refresh_tags();
         app.refresh_playlists();
@@ -245,8 +249,77 @@ impl App {
                     }
                 }
             }
+            self.poll_scan_if_due();
         }
         Ok(())
+    }
+
+    fn trigger_rescan(&mut self) {
+        match self.client.trigger_scan() {
+            Ok(state) => {
+                self.status_msg = if state.running {
+                    "rescanning library…".into()
+                } else {
+                    "scan triggered".into()
+                };
+                self.scan_polling = state.running;
+                self.last_scan_poll = Instant::now();
+            }
+            Err(e) => {
+                self.status_msg = format!("scan: {e}");
+            }
+        }
+    }
+
+    fn poll_scan_if_due(&mut self) {
+        if !self.scan_polling {
+            return;
+        }
+        if self.last_scan_poll.elapsed() < Duration::from_millis(1500) {
+            return;
+        }
+        self.last_scan_poll = Instant::now();
+        let state = match self.client.scan_status() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if state.running {
+            return;
+        }
+        self.scan_polling = false;
+        if let Some(err) = state.last_error {
+            self.status_msg = format!("scan failed: {err}");
+            return;
+        }
+        let summary = state.last_stats.as_ref().map(|s| {
+            format!(
+                "scan done: seen={} +{} ~{} ={} fail={}",
+                s.seen, s.inserted, s.updated, s.unchanged, s.failed
+            )
+        });
+        match self.client.list_tracks() {
+            Ok(t) => {
+                self.tracks = t;
+                let prev_id = self.selected_track().map(|t| t.id);
+                self.apply_filter("");
+                if let Some(id) = prev_id {
+                    if let Some(pos) = self.filtered.iter().position(|&i| self.tracks[i].id == id) {
+                        self.list_state.select(Some(pos));
+                    }
+                }
+                self.current_tags_for = None;
+                self.refresh_tags();
+                self.status_msg = summary.unwrap_or_else(|| {
+                    format!("scan done — {} tracks", self.tracks.len())
+                });
+            }
+            Err(e) => {
+                self.status_msg = format!(
+                    "{} (reload failed: {e})",
+                    summary.unwrap_or_else(|| "scan done".into())
+                );
+            }
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -451,6 +524,10 @@ impl App {
                 self.mpv.set_loop_playlist(lp)?;
                 self.mpv.set_loop_file(lf)?;
                 self.status_msg = self.repeat.status_label().into();
+                return Ok(());
+            }
+            (KeyCode::Char('F'), _) => {
+                self.trigger_rescan();
                 return Ok(());
             }
             _ => {}
@@ -1587,7 +1664,7 @@ impl App {
                             "j/k  ⏎ jump  d remove  space pause  n/p next/prev  S shuffle  R repeat  1-4 tabs  H hide help  q"
                         }
                         (Tab::Settings, _) => {
-                            "j/k field  ⏎/e edit  s save  r revert  1-4 tabs  H hide help  q"
+                            "j/k field  ⏎/e edit  s save  r revert  F rescan  1-4 tabs  H hide help  q"
                         }
                         (Tab::Playlists, _) => match self.playlists_focus {
                             PlaylistsFocus::List => {
