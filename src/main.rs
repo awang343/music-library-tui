@@ -14,7 +14,7 @@ mod mpv;
 mod settings;
 
 #[derive(Parser, Debug)]
-#[command(name = "music-lib-tui", about = "TUI client for music-lib")]
+#[command(name = "mutui", about = "TUI client for Muserv")]
 struct Cli {
     /// Server base URL (overrides settings file).
     #[arg(short, long, env = "MUSIC_LIB_URL")]

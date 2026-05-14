@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, Clone, Default)]
 pub struct PlayerState {
@@ -35,7 +35,7 @@ pub struct Mpv {
 impl Mpv {
     pub fn spawn(http_headers: &[String]) -> Result<Self> {
         let socket_path = std::env::temp_dir()
-            .join(format!("music-lib-mpv-{}.sock", std::process::id()));
+            .join(format!("mutui-mpv-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket_path);
 
         let mut cmd = Command::new("mpv");
@@ -176,6 +176,10 @@ impl Mpv {
         self.send(json!({"command": ["playlist-play-index", index]}))
     }
 
+    pub fn playlist_move(&mut self, from: i64, to: i64) -> Result<()> {
+        self.send(json!({"command": ["playlist-move", from, to]}))
+    }
+
     pub fn next(&mut self) -> Result<()> {
         self.send(json!({"command": ["playlist-next"]}))
     }
@@ -184,8 +188,46 @@ impl Mpv {
         self.send(json!({"command": ["playlist-prev"]}))
     }
 
+    /// Shuffle the queue while keeping the currently-playing track at index 0.
+    /// If nothing is playing, falls back to mpv's full playlist-shuffle.
     pub fn shuffle(&mut self) -> Result<()> {
-        self.send(json!({"command": ["playlist-shuffle"]}))
+        let snap = self.snapshot();
+        let n = snap.playlist.len();
+        if n < 2 {
+            return Ok(());
+        }
+        let Some(ci) = snap.playlist.iter().position(|e| e.current) else {
+            return self.send(json!({"command": ["playlist-shuffle"]}));
+        };
+
+        let urls: Vec<String> = snap.playlist.iter().map(|e| e.url.clone()).collect();
+        let mut others: Vec<String> = urls
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != ci)
+            .map(|(_, u)| u.clone())
+            .collect();
+        shuffle_in_place(&mut others);
+
+        let mut target: Vec<String> = Vec::with_capacity(n);
+        target.push(urls[ci].clone());
+        target.extend(others);
+
+        // Apply via playlist-move from highest-to-lowest, placing target[i] at i.
+        let mut working: Vec<String> = urls;
+        for i in 0..n {
+            if working[i] == target[i] {
+                continue;
+            }
+            let Some(rel_j) = working.iter().skip(i).position(|u| u == &target[i]) else {
+                continue;
+            };
+            let j = i + rel_j;
+            self.send(json!({"command": ["playlist-move", j, i]}))?;
+            let item = working.remove(j);
+            working.insert(i, item);
+        }
+        Ok(())
     }
 
     pub fn set_loop_playlist(&mut self, value: &str) -> Result<()> {
@@ -216,5 +258,22 @@ impl Drop for Mpv {
         let _ = self.send(json!({"command": ["quit"]}));
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+fn shuffle_in_place<T>(v: &mut [T]) {
+    let mut state = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0xdead_beef);
+    if state == 0 {
+        state = 0xdead_beef;
+    }
+    for i in (1..v.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state as usize) % (i + 1);
+        v.swap(i, j);
     }
 }

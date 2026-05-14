@@ -3,7 +3,7 @@ use crate::mpv::Mpv;
 use crate::settings::Settings;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
@@ -509,6 +509,10 @@ impl App {
                 self.show_help = !self.show_help;
                 return Ok(());
             }
+            (KeyCode::Esc, _) if self.show_help => {
+                self.show_help = false;
+                return Ok(());
+            }
             (KeyCode::Char('S'), _) => {
                 self.mpv.shuffle()?;
                 self.status_msg = "shuffled queue".into();
@@ -904,6 +908,7 @@ impl App {
             }
             KeyCode::Enter => self.play_selected()?,
             KeyCode::Char('a') => self.enqueue_selected()?,
+            KeyCode::Char('E') => self.enqueue_all_filtered()?,
             KeyCode::Char('A') => {
                 if let Some(t) = self.selected_track().map(|t| t.id) {
                     if self.playlists.is_empty() {
@@ -979,8 +984,31 @@ impl App {
                     self.mpv.playlist_remove_index(idx as i64)?;
                 }
             }
+            KeyCode::Char('J') => self.move_queue_item(1)?,
+            KeyCode::Char('K') => self.move_queue_item(-1)?,
             _ => {}
         }
+        Ok(())
+    }
+
+    fn move_queue_item(&mut self, delta: i32) -> Result<()> {
+        let len = self.mpv.snapshot().playlist.len() as i32;
+        if len < 2 {
+            return Ok(());
+        }
+        let Some(cur) = self.queue_state.selected() else {
+            return Ok(());
+        };
+        let cur = cur as i32;
+        let new = cur + delta;
+        if new < 0 || new >= len {
+            return Ok(());
+        }
+        // mpv playlist-move quirk: when src < dst, the moved entry ends up at dst-1.
+        // So bump dst by one for downward moves to land exactly at `new`.
+        let dst = if delta > 0 { new + 1 } else { new };
+        self.mpv.playlist_move(cur as i64, dst as i64)?;
+        self.queue_state.select(Some(new as usize));
         Ok(())
     }
 
@@ -1208,6 +1236,20 @@ impl App {
         Ok(())
     }
 
+    fn enqueue_all_filtered(&mut self) -> Result<()> {
+        if self.filtered.is_empty() {
+            self.status_msg = "nothing to queue".into();
+            return Ok(());
+        }
+        let ids: Vec<i64> = self.filtered.iter().map(|&i| self.tracks[i].id).collect();
+        for id in &ids {
+            let url = self.client.stream_url(*id);
+            self.mpv.enqueue(&url)?;
+        }
+        self.status_msg = format!("queued {} tracks", ids.len());
+        Ok(())
+    }
+
     fn toggle_pause(&mut self) -> Result<()> {
         let snap = self.mpv.snapshot();
         if snap.idle_active || snap.current_path.is_none() {
@@ -1236,12 +1278,13 @@ impl App {
     }
 
     fn render(&mut self, f: &mut Frame) {
+        let footer_height = if matches!(self.mode, Mode::Normal) { 3 } else { 4 };
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(1),
-                Constraint::Length(4),
+                Constraint::Length(footer_height),
             ])
             .split(f.size());
 
@@ -1255,9 +1298,117 @@ impl App {
         self.render_footer(f, outer[2]);
 
         // Modal overlays on top of everything.
+        if self.show_help {
+            self.render_help_overlay(f);
+        }
         if let Mode::PickPlaylist { .. } = &self.mode {
             self.render_pick_playlist_overlay(f);
         }
+    }
+
+    fn render_help_overlay(&self, f: &mut Frame) {
+        let area = centered_rect(70, 80, f.size());
+        f.render_widget(ratatui::widgets::Clear, area);
+
+        let header = |s: &'static str| {
+            Line::from(Span::styled(
+                s,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        };
+        let item = |k: &str, d: &str| {
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<16}", k),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(d.to_string()),
+            ])
+        };
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(header("Global"));
+        lines.push(item("q / Ctrl+C", "quit"));
+        lines.push(item("space", "play / pause"));
+        lines.push(item("n / p", "next / previous"));
+        lines.push(item("S", "shuffle queue"));
+        lines.push(item("R", "cycle repeat (off/all/one)"));
+        lines.push(item("F", "rescan library"));
+        lines.push(item("H", "toggle this help"));
+        lines.push(item("1-4", "switch tabs"));
+        lines.push(Line::raw(""));
+
+        match self.tab {
+            Tab::Songs => match self.focus {
+                Focus::Tracks => {
+                    lines.push(header("Songs — tracks"));
+                    lines.push(item("j/k, PgUp/Dn", "move selection"));
+                    lines.push(item("g / G", "top / bottom"));
+                    lines.push(item("⏎", "play selected"));
+                    lines.push(item("a", "queue selected"));
+                    lines.push(item("E", "queue all (filtered)"));
+                    lines.push(item("A", "add to playlist"));
+                    lines.push(item("/", "filter"));
+                    lines.push(item("?", "tag search"));
+                    lines.push(item("⇥", "switch to tags pane"));
+                    lines.push(item("Esc", "clear filter"));
+                }
+                Focus::Tags => {
+                    lines.push(header("Songs — tags"));
+                    lines.push(item("j/k", "navigate tags"));
+                    lines.push(item("g / G", "top / bottom"));
+                    lines.push(item("a", "add tag"));
+                    lines.push(item("d", "remove user tag"));
+                    lines.push(item("⇥ / Esc", "back to tracks"));
+                }
+            },
+            Tab::Playlists => match self.playlists_focus {
+                PlaylistsFocus::List => {
+                    lines.push(header("Playlists"));
+                    lines.push(item("j/k", "navigate"));
+                    lines.push(item("⏎", "open playlist"));
+                    lines.push(item("P", "play playlist"));
+                    lines.push(item("N", "new playlist"));
+                    lines.push(item("r", "rename"));
+                    lines.push(item("D", "delete"));
+                    lines.push(item("⇥", "tracks pane"));
+                }
+                PlaylistsFocus::Tracks => {
+                    lines.push(header("Playlist tracks"));
+                    lines.push(item("j/k", "navigate"));
+                    lines.push(item("J / K", "reorder down / up"));
+                    lines.push(item("⏎", "play from here"));
+                    lines.push(item("a", "queue track"));
+                    lines.push(item("d", "remove from playlist"));
+                    lines.push(item("⇥ / Esc", "back to playlists"));
+                }
+            },
+            Tab::Queue => {
+                lines.push(header("Queue"));
+                lines.push(item("j/k", "navigate"));
+                lines.push(item("g / G", "top / bottom"));
+                lines.push(item("J / K", "reorder down / up"));
+                lines.push(item("⏎", "jump to track"));
+                lines.push(item("d", "remove from queue"));
+            }
+            Tab::Settings => {
+                lines.push(header("Settings"));
+                lines.push(item("j/k", "navigate fields"));
+                lines.push(item("⏎ / e", "edit field"));
+                lines.push(item("s", "save changes"));
+                lines.push(item("r / Esc", "revert"));
+            }
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Help (H to close) ");
+        let p = Paragraph::new(lines).block(block);
+        f.render_widget(p, area);
     }
 
     fn render_playlists(&mut self, f: &mut Frame, area: Rect) {
@@ -1526,7 +1677,7 @@ impl App {
             .collect();
 
         let title = format!(
-            " music-lib-tui — {} / {} ",
+            " muserv — {} / {} ",
             self.filtered.len(),
             self.tracks.len()
         );
@@ -1566,10 +1717,41 @@ impl App {
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
-        let now = self.now_playing_line();
-        let prompt = self.prompt_or_hints_line();
-        let p = Paragraph::new(vec![now, prompt]).block(Block::default().borders(Borders::ALL));
-        f.render_widget(p, area);
+        let block = Block::default().borders(Borders::ALL);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let normal = matches!(self.mode, Mode::Normal);
+        let constraints: &[Constraint] = if normal {
+            &[Constraint::Length(1)]
+        } else {
+            &[Constraint::Length(1), Constraint::Length(1)]
+        };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(inner);
+
+        let status_width = self.status_msg.chars().count() as u16;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(status_width)])
+            .split(rows[0]);
+        f.render_widget(Paragraph::new(self.now_playing_line()), cols[0]);
+        if status_width > 0 {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    self.status_msg.clone(),
+                    Style::default().fg(Color::Yellow),
+                )))
+                .alignment(Alignment::Right),
+                cols[1],
+            );
+        }
+
+        if !normal {
+            f.render_widget(Paragraph::new(self.prompt_or_hints_line()), rows[1]);
+        }
     }
 
     fn now_playing_line(&self) -> Line<'static> {
@@ -1651,46 +1833,7 @@ impl App {
                 "pick playlist (j/k, ⏎ confirm, Esc cancel)",
                 Style::default().fg(Color::Cyan),
             )),
-            Mode::Normal => {
-                if self.show_help {
-                    let hints = match (self.tab, self.focus) {
-                        (Tab::Songs, Focus::Tracks) => {
-                            "j/k  ⏎ play  a queue  A add to playlist  / filter  ? tag search  ⇥ tags  S shuffle  R repeat  1-4 tabs  H hide help  q"
-                        }
-                        (Tab::Songs, Focus::Tags) => {
-                            "j/k  a add  d remove  S shuffle  R repeat  ⇥/Esc back  1-4 tabs  H hide help  q"
-                        }
-                        (Tab::Queue, _) => {
-                            "j/k  ⏎ jump  d remove  space pause  n/p next/prev  S shuffle  R repeat  1-4 tabs  H hide help  q"
-                        }
-                        (Tab::Settings, _) => {
-                            "j/k field  ⏎/e edit  s save  r revert  F rescan  1-4 tabs  H hide help  q"
-                        }
-                        (Tab::Playlists, _) => match self.playlists_focus {
-                            PlaylistsFocus::List => {
-                                "j/k  ⏎ open  P play  N new  r rename  D delete  ⇥ tracks  S shuffle  R repeat  1-4 tabs  H hide help  q"
-                            }
-                            PlaylistsFocus::Tracks => {
-                                "j/k  J/K reorder  ⏎ play here  a queue  d remove  S shuffle  R repeat  ⇥/Esc back  1-4 tabs  H hide help  q"
-                            }
-                        },
-                    };
-                    Line::from(Span::styled(
-                        hints,
-                        Style::default().add_modifier(Modifier::DIM),
-                    ))
-                } else if !self.status_msg.is_empty() {
-                    Line::from(Span::styled(
-                        self.status_msg.clone(),
-                        Style::default().fg(Color::Yellow),
-                    ))
-                } else {
-                    Line::from(Span::styled(
-                        "H for help",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ))
-                }
-            }
+            Mode::Normal => Line::raw(""),
         }
     }
 }
