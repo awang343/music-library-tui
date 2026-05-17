@@ -23,6 +23,9 @@ enum Mode {
         index: usize,
         track_id: i64,
     },
+    SortPicker {
+        index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,12 +42,6 @@ impl SettingsField {
             SettingsField::AuthToken => "Auth Token",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    Tracks,
-    Tags,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +77,53 @@ impl RepeatMode {
             RepeatMode::Off => "repeat off",
             RepeatMode::All => "repeat all",
             RepeatMode::One => "repeat one",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    Default,
+    Title,
+    Artist,
+    Album,
+    Duration,
+    Year,
+    AddedAt,
+}
+
+impl SortKey {
+    const ALL: [SortKey; 7] = [
+        SortKey::Default,
+        SortKey::Title,
+        SortKey::Artist,
+        SortKey::Album,
+        SortKey::Duration,
+        SortKey::Year,
+        SortKey::AddedAt,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SortKey::Default => "Default (artist / album / track)",
+            SortKey::Title => "Title (A→Z)",
+            SortKey::Artist => "Artist (A→Z)",
+            SortKey::Album => "Album (A→Z)",
+            SortKey::Duration => "Duration (shortest first)",
+            SortKey::Year => "Year (newest first)",
+            SortKey::AddedAt => "Date added (newest first)",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            SortKey::Default => "default",
+            SortKey::Title => "title",
+            SortKey::Artist => "artist",
+            SortKey::Album => "album",
+            SortKey::Duration => "duration",
+            SortKey::Year => "year",
+            SortKey::AddedAt => "added",
         }
     }
 }
@@ -123,7 +167,6 @@ pub struct App {
     list_state: ListState,
     tags_state: ListState,
     queue_state: ListState,
-    focus: Focus,
     tab: Tab,
     mode: Mode,
     settings: Settings,
@@ -138,8 +181,10 @@ pub struct App {
     playlist_tracks_for: Option<i64>,
     current_tags_for: Option<i64>,
     repeat: RepeatMode,
+    sort_key: SortKey,
     status_msg: String,
     show_help: bool,
+    show_tags: bool,
     should_quit: bool,
     scan_polling: bool,
     last_scan_poll: Instant,
@@ -160,7 +205,6 @@ impl App {
             list_state,
             tags_state: ListState::default(),
             queue_state: ListState::default(),
-            focus: Focus::Tracks,
             tab: Tab::Songs,
             mode: Mode::Normal,
             saved_settings: settings.clone(),
@@ -175,13 +219,14 @@ impl App {
             playlist_tracks_state: ListState::default(),
             playlist_tracks_for: None,
             repeat: RepeatMode::Off,
+            sort_key: SortKey::Default,
             status_msg: String::new(),
             show_help: false,
+            show_tags: false,
             should_quit: false,
             scan_polling: false,
             last_scan_poll: Instant::now(),
         };
-        app.refresh_tags();
         app.refresh_playlists();
         app
     }
@@ -236,10 +281,11 @@ impl App {
         }
     }
 
-    pub fn run<B: ratatui::backend::Backend>(
-        &mut self,
-        terminal: &mut ratatui::Terminal<B>,
-    ) -> Result<()> {
+    pub fn run<B>(&mut self, terminal: &mut ratatui::Terminal<B>) -> Result<()>
+    where
+        B: ratatui::backend::Backend,
+        <B as ratatui::backend::Backend>::Error: std::error::Error + Send + Sync + 'static,
+    {
         while !self.should_quit {
             terminal.draw(|f| self.render(f))?;
             if event::poll(Duration::from_millis(200))? {
@@ -307,8 +353,8 @@ impl App {
                         self.list_state.select(Some(pos));
                     }
                 }
+                self.current_tags.clear();
                 self.current_tags_for = None;
-                self.refresh_tags();
                 self.status_msg = summary.unwrap_or_else(|| {
                     format!("scan done — {} tracks", self.tracks.len())
                 });
@@ -476,6 +522,34 @@ impl App {
                 self.mode = Mode::PickPlaylist { index, track_id };
                 return Ok(());
             }
+            Mode::SortPicker { mut index } => {
+                let len = SortKey::ALL.len();
+                match key.code {
+                    KeyCode::Esc => {
+                        self.mode = Mode::Normal;
+                        return Ok(());
+                    }
+                    KeyCode::Enter => {
+                        let chosen = SortKey::ALL.get(index).copied();
+                        self.mode = Mode::Normal;
+                        if let Some(k) = chosen {
+                            self.apply_sort(k);
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if len > 0 {
+                            index = (index + 1).min(len - 1);
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        index = index.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                self.mode = Mode::SortPicker { index };
+                return Ok(());
+            }
             Mode::Normal => {}
         }
 
@@ -483,6 +557,7 @@ impl App {
         if let KeyCode::Char(c) = key.code {
             if let Some(t) = Tab::from_digit(c) {
                 self.tab = t;
+                self.show_tags = false;
                 return Ok(());
             }
         }
@@ -505,12 +580,16 @@ impl App {
                 self.mpv.prev()?;
                 return Ok(());
             }
-            (KeyCode::Char('H'), _) => {
+            (KeyCode::Char('?'), _) => {
                 self.show_help = !self.show_help;
                 return Ok(());
             }
             (KeyCode::Esc, _) if self.show_help => {
                 self.show_help = false;
+                return Ok(());
+            }
+            (KeyCode::Esc, _) if self.show_tags => {
+                self.show_tags = false;
                 return Ok(());
             }
             (KeyCode::Char('S'), _) => {
@@ -844,13 +923,14 @@ impl App {
             Ok(t) => {
                 self.tracks = t;
                 self.filtered = (0..self.tracks.len()).collect();
+                self.sort_filtered();
                 self.list_state.select(if self.filtered.is_empty() {
                     None
                 } else {
                     Some(0)
                 });
+                self.current_tags.clear();
                 self.current_tags_for = None;
-                self.refresh_tags();
                 self.status_msg = format!("saved & reloaded ({} tracks)", self.tracks.len());
             }
             Err(e) => {
@@ -866,26 +946,14 @@ impl App {
     }
 
     fn handle_songs_key(&mut self, key: KeyEvent) -> Result<()> {
-        match (key.code, key.modifiers) {
-            (KeyCode::Tab, _) => {
-                self.toggle_focus();
-                return Ok(());
-            }
-            (KeyCode::Esc, _) => {
-                if self.focus == Focus::Tags {
-                    self.focus = Focus::Tracks;
-                } else {
-                    self.apply_filter("");
-                }
-                return Ok(());
-            }
-            _ => {}
+        if self.show_tags {
+            return self.handle_tags_key(key);
         }
-
-        match self.focus {
-            Focus::Tracks => self.handle_tracks_key(key),
-            Focus::Tags => self.handle_tags_key(key),
+        if matches!(key.code, KeyCode::Esc) {
+            self.apply_filter("");
+            return Ok(());
         }
+        self.handle_tracks_key(key)
     }
 
     fn handle_tracks_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -897,13 +965,11 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => {
                 if !self.filtered.is_empty() {
                     self.list_state.select(Some(0));
-                    self.refresh_tags();
                 }
             }
             KeyCode::Char('G') | KeyCode::End => {
                 if !self.filtered.is_empty() {
                     self.list_state.select(Some(self.filtered.len() - 1));
-                    self.refresh_tags();
                 }
             }
             KeyCode::Enter => self.play_selected()?,
@@ -919,10 +985,27 @@ impl App {
                 }
             }
             KeyCode::Char('/') => self.mode = Mode::Filter(String::new()),
-            KeyCode::Char('?') => self.mode = Mode::TagSearch(String::new()),
+            KeyCode::Char('T') => self.mode = Mode::TagSearch(String::new()),
+            KeyCode::Char('t') => self.open_tags_popup(),
+            KeyCode::Char('s') => {
+                let index = SortKey::ALL
+                    .iter()
+                    .position(|k| *k == self.sort_key)
+                    .unwrap_or(0);
+                self.mode = Mode::SortPicker { index };
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    fn open_tags_popup(&mut self) {
+        if self.selected_track().is_none() {
+            self.status_msg = "no track selected".into();
+            return;
+        }
+        self.refresh_tags();
+        self.show_tags = true;
     }
 
     fn run_tag_search(&mut self, query: &str) {
@@ -940,9 +1023,9 @@ impl App {
                     .map(|(i, t)| (t.id, i))
                     .collect();
                 self.filtered = hits.iter().filter_map(|t| by_id.get(&t.id).copied()).collect();
+                self.sort_filtered();
                 self.list_state
                     .select(if self.filtered.is_empty() { None } else { Some(0) });
-                self.refresh_tags();
                 self.status_msg = format!("tag search '{q}': {} hits", self.filtered.len());
             }
             Err(e) => self.status_msg = format!("search failed: {e}"),
@@ -1028,19 +1111,10 @@ impl App {
             }
             KeyCode::Char('a') => self.mode = Mode::AddTag(String::new()),
             KeyCode::Char('d') => self.delete_selected_tag()?,
+            KeyCode::Char('t') => self.show_tags = false,
             _ => {}
         }
         Ok(())
-    }
-
-    fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Tracks => Focus::Tags,
-            Focus::Tags => Focus::Tracks,
-        };
-        if self.focus == Focus::Tags && !self.current_tags.is_empty() && self.tags_state.selected().is_none() {
-            self.tags_state.select(Some(0));
-        }
     }
 
     fn move_tag_selection(&mut self, delta: i32) {
@@ -1154,9 +1228,29 @@ impl App {
                 .map(|(i, _)| i)
                 .collect();
         }
+        self.sort_filtered();
         let sel = if self.filtered.is_empty() { None } else { Some(0) };
         self.list_state.select(sel);
-        self.refresh_tags();
+    }
+
+    fn sort_filtered(&mut self) {
+        let tracks = &self.tracks;
+        let key = self.sort_key;
+        self.filtered.sort_by(|&a, &b| cmp_tracks(&tracks[a], &tracks[b], key));
+    }
+
+    fn apply_sort(&mut self, key: SortKey) {
+        let prev_id = self.selected_track().map(|t| t.id);
+        self.sort_key = key;
+        self.sort_filtered();
+        let new_sel = match prev_id {
+            Some(id) => self.filtered.iter().position(|&i| self.tracks[i].id == id),
+            None => (!self.filtered.is_empty()).then_some(0),
+        };
+        self.list_state.select(new_sel.or_else(|| {
+            if self.filtered.is_empty() { None } else { Some(0) }
+        }));
+        self.status_msg = format!("sort: {}", key.short_label());
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -1168,7 +1262,6 @@ impl App {
         let next = (cur + delta).clamp(0, len - 1);
         if next as usize != self.list_state.selected().unwrap_or(usize::MAX) {
             self.list_state.select(Some(next as usize));
-            self.refresh_tags();
         }
     }
 
@@ -1286,7 +1379,7 @@ impl App {
                 Constraint::Min(1),
                 Constraint::Length(footer_height),
             ])
-            .split(f.size());
+            .split(f.area());
 
         self.render_tabs(f, outer[0]);
         match self.tab {
@@ -1298,16 +1391,58 @@ impl App {
         self.render_footer(f, outer[2]);
 
         // Modal overlays on top of everything.
+        if self.tab == Tab::Songs && self.show_tags {
+            self.render_tags_overlay(f);
+        }
         if self.show_help {
             self.render_help_overlay(f);
         }
         if let Mode::PickPlaylist { .. } = &self.mode {
             self.render_pick_playlist_overlay(f);
         }
+        if let Mode::SortPicker { .. } = &self.mode {
+            self.render_sort_picker_overlay(f);
+        }
+    }
+
+    fn render_sort_picker_overlay(&self, f: &mut Frame) {
+        let Mode::SortPicker { index } = self.mode else {
+            return;
+        };
+        let area = centered_rect(50, 50, f.area());
+        f.render_widget(ratatui::widgets::Clear, area);
+
+        let items: Vec<ListItem> = SortKey::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let is_cursor = i == index;
+                let is_active = *k == self.sort_key;
+                let prefix = if is_cursor { "> " } else { "  " };
+                let marker = if is_active { " *" } else { "" };
+                let style = if is_cursor {
+                    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else if is_active {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{prefix}{}{marker}", k.label()),
+                    style,
+                )))
+            })
+            .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Sort by  (j/k, ⏎ confirm, Esc cancel) ");
+        let list = List::new(items).block(block);
+        f.render_widget(list, area);
     }
 
     fn render_help_overlay(&self, f: &mut Frame) {
-        let area = centered_rect(70, 80, f.size());
+        let area = centered_rect(70, 80, f.area());
         f.render_widget(ratatui::widgets::Clear, area);
 
         let header = |s: &'static str| {
@@ -1337,34 +1472,34 @@ impl App {
         lines.push(item("S", "shuffle queue"));
         lines.push(item("R", "cycle repeat (off/all/one)"));
         lines.push(item("F", "rescan library"));
-        lines.push(item("H", "toggle this help"));
+        lines.push(item("?", "toggle this help"));
         lines.push(item("1-4", "switch tabs"));
         lines.push(Line::raw(""));
 
         match self.tab {
-            Tab::Songs => match self.focus {
-                Focus::Tracks => {
-                    lines.push(header("Songs — tracks"));
+            Tab::Songs => {
+                if self.show_tags {
+                    lines.push(header("Songs — tags popup"));
+                    lines.push(item("j/k", "navigate tags"));
+                    lines.push(item("g / G", "top / bottom"));
+                    lines.push(item("a", "add tag"));
+                    lines.push(item("d", "remove user tag"));
+                    lines.push(item("t / Esc", "close tags popup"));
+                } else {
+                    lines.push(header("Songs"));
                     lines.push(item("j/k, PgUp/Dn", "move selection"));
                     lines.push(item("g / G", "top / bottom"));
                     lines.push(item("⏎", "play selected"));
                     lines.push(item("a", "queue selected"));
                     lines.push(item("E", "queue all (filtered)"));
                     lines.push(item("A", "add to playlist"));
+                    lines.push(item("t", "show tags for selected"));
                     lines.push(item("/", "filter"));
-                    lines.push(item("?", "tag search"));
-                    lines.push(item("⇥", "switch to tags pane"));
+                    lines.push(item("T", "tag search"));
+                    lines.push(item("s", "sort by…"));
                     lines.push(item("Esc", "clear filter"));
                 }
-                Focus::Tags => {
-                    lines.push(header("Songs — tags"));
-                    lines.push(item("j/k", "navigate tags"));
-                    lines.push(item("g / G", "top / bottom"));
-                    lines.push(item("a", "add tag"));
-                    lines.push(item("d", "remove user tag"));
-                    lines.push(item("⇥ / Esc", "back to tracks"));
-                }
-            },
+            }
             Tab::Playlists => match self.playlists_focus {
                 PlaylistsFocus::List => {
                     lines.push(header("Playlists"));
@@ -1406,7 +1541,7 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
-            .title(" Help (H to close) ");
+            .title(" Help (? to close) ");
         let p = Paragraph::new(lines).block(block);
         f.render_widget(p, area);
     }
@@ -1479,7 +1614,7 @@ impl App {
         let Mode::PickPlaylist { index, .. } = self.mode else {
             return;
         };
-        let area = centered_rect(60, 60, f.size());
+        let area = centered_rect(60, 60, f.area());
         f.render_widget(ratatui::widgets::Clear, area);
 
         let items: Vec<ListItem> = self
@@ -1508,12 +1643,7 @@ impl App {
     }
 
     fn render_songs(&mut self, f: &mut Frame, area: Rect) {
-        let upper = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-            .split(area);
-        self.render_list(f, upper[0]);
-        self.render_tags(f, upper[1]);
+        self.render_list(f, area);
     }
 
     fn render_tabs(&self, f: &mut Frame, area: Rect) {
@@ -1681,7 +1811,7 @@ impl App {
             self.filtered.len(),
             self.tracks.len()
         );
-        let block = pane_block(title, self.focus == Focus::Tracks);
+        let block = pane_block(title, true);
         let list = List::new(items)
             .block(block)
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
@@ -1690,7 +1820,10 @@ impl App {
         f.render_stateful_widget(list, area, &mut self.list_state);
     }
 
-    fn render_tags(&mut self, f: &mut Frame, area: Rect) {
+    fn render_tags_overlay(&mut self, f: &mut Frame) {
+        let area = centered_rect(60, 70, f.area());
+        f.render_widget(ratatui::widgets::Clear, area);
+
         let items: Vec<ListItem> = self
             .current_tags
             .iter()
@@ -1707,12 +1840,22 @@ impl App {
                 )]))
             })
             .collect();
-        let title = format!(" tags ({}) ", self.current_tags.len());
-        let block = pane_block(title, self.focus == Focus::Tags);
-        let mut list = List::new(items).block(block);
-        if self.focus == Focus::Tags {
-            list = list.highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+        let track_label = self
+            .selected_track()
+            .map(|t| format!("{} — {}", t.display_artist(), t.display_title()))
+            .unwrap_or_else(|| "no track".into());
+        let title = format!(" Tags — {} ({}) ", track_label, self.current_tags.len());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title);
+        if self.tags_state.selected().is_none() && !self.current_tags.is_empty() {
+            self.tags_state.select(Some(0));
         }
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, area, &mut self.tags_state);
     }
 
@@ -1799,7 +1942,7 @@ impl App {
                 Span::raw("_"),
             ]),
             Mode::TagSearch(buf) => Line::from(vec![
-                Span::styled("?", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled("T", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 Span::raw(" tag: "),
                 Span::raw(buf.clone()),
                 Span::raw("_"),
@@ -1833,6 +1976,10 @@ impl App {
                 "pick playlist (j/k, ⏎ confirm, Esc cancel)",
                 Style::default().fg(Color::Cyan),
             )),
+            Mode::SortPicker { .. } => Line::from(Span::styled(
+                "sort songs (j/k, ⏎ confirm, Esc cancel)",
+                Style::default().fg(Color::Cyan),
+            )),
             Mode::Normal => Line::raw(""),
         }
     }
@@ -1855,6 +2002,47 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_y[1])[1]
+}
+
+fn cmp_tracks(a: &Track, b: &Track, key: SortKey) -> std::cmp::Ordering {
+    let s = |x: &str| x.to_lowercase();
+    match key {
+        SortKey::Default => {
+            let aa = a.album_artist.as_deref().unwrap_or("");
+            let ba = b.album_artist.as_deref().unwrap_or("");
+            s(aa).cmp(&s(ba))
+                .then_with(|| {
+                    s(a.album.as_deref().unwrap_or(""))
+                        .cmp(&s(b.album.as_deref().unwrap_or("")))
+                })
+                .then(a.disc_no.unwrap_or(0).cmp(&b.disc_no.unwrap_or(0)))
+                .then(a.track_no.unwrap_or(0).cmp(&b.track_no.unwrap_or(0)))
+                .then_with(|| s(a.display_title()).cmp(&s(b.display_title())))
+        }
+        SortKey::Title => s(a.display_title()).cmp(&s(b.display_title())),
+        SortKey::Artist => s(a.display_artist())
+            .cmp(&s(b.display_artist()))
+            .then_with(|| s(a.display_album()).cmp(&s(b.display_album())))
+            .then(a.disc_no.unwrap_or(0).cmp(&b.disc_no.unwrap_or(0)))
+            .then(a.track_no.unwrap_or(0).cmp(&b.track_no.unwrap_or(0))),
+        SortKey::Album => s(a.display_album())
+            .cmp(&s(b.display_album()))
+            .then(a.disc_no.unwrap_or(0).cmp(&b.disc_no.unwrap_or(0)))
+            .then(a.track_no.unwrap_or(0).cmp(&b.track_no.unwrap_or(0))),
+        SortKey::Duration => a
+            .duration_ms
+            .unwrap_or(i64::MAX)
+            .cmp(&b.duration_ms.unwrap_or(i64::MAX)),
+        // Year and AddedAt are "newest first": descending.
+        SortKey::Year => b
+            .year
+            .unwrap_or(i64::MIN)
+            .cmp(&a.year.unwrap_or(i64::MIN))
+            .then_with(|| s(a.display_album()).cmp(&s(b.display_album())))
+            .then(a.disc_no.unwrap_or(0).cmp(&b.disc_no.unwrap_or(0)))
+            .then(a.track_no.unwrap_or(0).cmp(&b.track_no.unwrap_or(0))),
+        SortKey::AddedAt => b.added_at.cmp(&a.added_at),
+    }
 }
 
 fn pane_block(title: String, focused: bool) -> Block<'static> {
